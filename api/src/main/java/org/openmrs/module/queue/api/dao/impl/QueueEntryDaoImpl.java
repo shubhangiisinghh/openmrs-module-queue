@@ -44,10 +44,22 @@ public class QueueEntryDaoImpl extends AbstractBaseQueueDaoImpl<QueueEntry> impl
 		CriteriaBuilder cb = session.getCriteriaBuilder();
 		CriteriaQuery<QueueEntry> query = cb.createQuery(QueueEntry.class);
 		Root<QueueEntry> root = query.from(QueueEntry.class);
+		
+		// Fetch joins to load associations in one query
+		// instead of firing a separate SELECT per row (N+1 problem)
+		root.fetch("queue", JoinType.LEFT);
+		root.fetch("patient", JoinType.LEFT);
+		root.fetch("priority", JoinType.LEFT);
+		root.fetch("status", JoinType.LEFT);
+		root.fetch("visit", JoinType.LEFT);
+		root.fetch("queueComingFrom", JoinType.LEFT);
+		
 		List<Predicate> predicates = buildPredicates(cb, root, searchCriteria);
 		query.where(cb.and(predicates.toArray(new Predicate[0])));
+		query.distinct(true); // eliminates duplicate roots from fetch joins
 		query.orderBy(cb.desc(root.get("sortWeight")), cb.asc(root.get("startedAt")), cb.asc(root.get("dateCreated")),
 		    cb.asc(root.get("queueEntryId")));
+		
 		return session.createQuery(query).getResultList();
 	}
 	
