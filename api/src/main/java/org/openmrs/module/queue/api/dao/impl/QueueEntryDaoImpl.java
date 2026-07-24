@@ -11,6 +11,9 @@ package org.openmrs.module.queue.api.dao.impl;
 
 import javax.persistence.criteria.CriteriaBuilder;
 import javax.persistence.criteria.CriteriaQuery;
+import javax.persistence.criteria.Join;
+import javax.persistence.criteria.JoinType;
+import javax.persistence.criteria.Path;
 import javax.persistence.criteria.Predicate;
 import javax.persistence.criteria.Root;
 
@@ -21,12 +24,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.hibernate.Criteria;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
-import org.hibernate.criterion.Projections;
-import org.hibernate.criterion.Restrictions;
-import org.hibernate.query.Query;
 import org.openmrs.Patient;
 import org.openmrs.module.queue.api.dao.QueueEntryDao;
 import org.openmrs.module.queue.api.search.QueueEntrySearchCriteria;
@@ -43,134 +42,39 @@ public class QueueEntryDaoImpl extends AbstractBaseQueueDaoImpl<QueueEntry> impl
 	
 	@Override
 	public List<QueueEntry> getQueueEntries(QueueEntrySearchCriteria searchCriteria) {
-		// Optimized HQL query with explicit fetch joins
-		// Reduces query from 59 joins to 11 joins for 60-80% performance improvement
-		StringBuilder hql = new StringBuilder();
-		hql.append("SELECT qe FROM QueueEntry qe "); // Removed DISTINCT from here
-		hql.append("JOIN FETCH qe.queue q ");
-		hql.append("JOIN FETCH qe.patient p ");
-		hql.append("JOIN FETCH qe.priority pr ");
-		hql.append("JOIN FETCH qe.status s ");
-		hql.append("LEFT JOIN FETCH qe.visit v ");
-		hql.append("LEFT JOIN FETCH qe.queueComingFrom qcf ");
-		hql.append("WHERE qe.voided = :voided ");
+		Session session = getSessionFactory().getCurrentSession();
+		CriteriaBuilder cb = session.getCriteriaBuilder();
+		CriteriaQuery<QueueEntry> query = cb.createQuery(QueueEntry.class);
+		Root<QueueEntry> root = query.from(QueueEntry.class);
 		
-		Map<String, Object> params = new HashMap<>();
-		params.put("voided", searchCriteria.isIncludedVoided());
+		// Fetch joins to load associations in one query
+		// instead of firing a separate SELECT per row (N+1 problem)
+		root.fetch("queue", JoinType.LEFT);
+		root.fetch("patient", JoinType.LEFT);
+		root.fetch("priority", JoinType.LEFT);
+		root.fetch("status", JoinType.LEFT);
+		root.fetch("visit", JoinType.LEFT);
+		root.fetch("queueComingFrom", JoinType.LEFT);
 		
-		// Apply search filters
-		if (searchCriteria.getQueues() != null && !searchCriteria.getQueues().isEmpty()) {
-			hql.append("AND qe.queue IN (:queues) ");
-			params.put("queues", searchCriteria.getQueues());
-		}
+		List<Predicate> predicates = buildPredicates(cb, root, searchCriteria);
+		query.where(cb.and(predicates.toArray(new Predicate[0])));
+		query.distinct(true); // eliminates duplicate roots from fetch joins
+		query.orderBy(cb.desc(root.get("sortWeight")), cb.asc(root.get("startedAt")), cb.asc(root.get("dateCreated")),
+		    cb.asc(root.get("queueEntryId")));
 		
-		if (searchCriteria.getLocations() != null && !searchCriteria.getLocations().isEmpty()) {
-			hql.append("AND q.location IN (:locations) ");
-			params.put("locations", searchCriteria.getLocations());
-		}
-		
-		if (searchCriteria.getServices() != null && !searchCriteria.getServices().isEmpty()) {
-			hql.append("AND q.service IN (:services) ");
-			params.put("services", searchCriteria.getServices());
-		}
-		
-		if (searchCriteria.getPatient() != null) {
-			hql.append("AND qe.patient = :patient ");
-			params.put("patient", searchCriteria.getPatient());
-		}
-		
-		if (searchCriteria.getVisit() != null) {
-			hql.append("AND qe.visit = :visit ");
-			params.put("visit", searchCriteria.getVisit());
-		}
-		
-		if (searchCriteria.getStatuses() != null && !searchCriteria.getStatuses().isEmpty()) {
-			hql.append("AND qe.status IN (:statuses) ");
-			params.put("statuses", searchCriteria.getStatuses());
-		}
-		
-		if (searchCriteria.getPriorities() != null && !searchCriteria.getPriorities().isEmpty()) {
-			hql.append("AND qe.priority IN (:priorities) ");
-			params.put("priorities", searchCriteria.getPriorities());
-		}
-		
-		if (searchCriteria.getLocationsWaitingFor() != null && !searchCriteria.getLocationsWaitingFor().isEmpty()) {
-			hql.append("AND qe.locationWaitingFor IN (:locationsWaitingFor) ");
-			params.put("locationsWaitingFor", searchCriteria.getLocationsWaitingFor());
-		}
-		
-		if (searchCriteria.getProvidersWaitingFor() != null && !searchCriteria.getProvidersWaitingFor().isEmpty()) {
-			hql.append("AND qe.providerWaitingFor IN (:providersWaitingFor) ");
-			params.put("providersWaitingFor", searchCriteria.getProvidersWaitingFor());
-		}
-		
-		if (searchCriteria.getQueuesComingFrom() != null && !searchCriteria.getQueuesComingFrom().isEmpty()) {
-			hql.append("AND qe.queueComingFrom IN (:queuesComingFrom) ");
-			params.put("queuesComingFrom", searchCriteria.getQueuesComingFrom());
-		}
-		
-		if (searchCriteria.getHasVisit() == Boolean.TRUE) {
-			hql.append("AND qe.visit IS NOT NULL ");
-		} else if (searchCriteria.getHasVisit() == Boolean.FALSE) {
-			hql.append("AND qe.visit IS NULL ");
-		}
-		
-		if (searchCriteria.getIsEnded() == Boolean.TRUE) {
-			hql.append("AND qe.endedAt IS NOT NULL ");
-		} else if (searchCriteria.getIsEnded() == Boolean.FALSE) {
-			hql.append("AND qe.endedAt IS NULL ");
-		}
-		
-		if (searchCriteria.getStartedOnOrAfter() != null) {
-			hql.append("AND qe.startedAt >= :startedOnOrAfter ");
-			params.put("startedOnOrAfter", searchCriteria.getStartedOnOrAfter());
-		}
-		
-		if (searchCriteria.getStartedOnOrBefore() != null) {
-			hql.append("AND qe.startedAt <= :startedOnOrBefore ");
-			params.put("startedOnOrBefore", searchCriteria.getStartedOnOrBefore());
-		}
-		
-		if (searchCriteria.getStartedOn() != null) {
-			hql.append("AND qe.startedAt = :startedOn ");
-			params.put("startedOn", searchCriteria.getStartedOn());
-		}
-		
-		if (searchCriteria.getEndedOnOrAfter() != null) {
-			hql.append("AND qe.endedAt >= :endedOnOrAfter ");
-			params.put("endedOnOrAfter", searchCriteria.getEndedOnOrAfter());
-		}
-		
-		if (searchCriteria.getEndedOnOrBefore() != null) {
-			hql.append("AND qe.endedAt <= :endedOnOrBefore ");
-			params.put("endedOnOrBefore", searchCriteria.getEndedOnOrBefore());
-		}
-		
-		if (searchCriteria.getEndedOn() != null) {
-			hql.append("AND qe.endedAt = :endedOn ");
-			params.put("endedOn", searchCriteria.getEndedOn());
-		}
-		
-		// Apply ordering
-		hql.append("ORDER BY qe.sortWeight DESC, qe.startedAt ASC, qe.dateCreated ASC, qe.queueEntryId ASC");
-		
-		// Execute query with generic type
-		Query<QueueEntry> query = getCurrentSession().createQuery(hql.toString(), QueueEntry.class);
-		for (Map.Entry<String, Object> entry : params.entrySet()) {
-			query.setParameter(entry.getKey(), entry.getValue());
-		}
-		
-		// Use setResultTransformer to eliminate duplicates from JOIN FETCH
-		query.setResultTransformer(Criteria.DISTINCT_ROOT_ENTITY);
-		
-		return query.list();
+		return session.createQuery(query).getResultList();
 	}
 	
 	@Override
 	public Long getCountOfQueueEntries(QueueEntrySearchCriteria searchCriteria) {
-		Criteria criteria = createCriteriaFromSearchCriteria(searchCriteria);
-		criteria.setProjection(Projections.rowCount());
-		return (Long) criteria.uniqueResult();
+		Session session = getSessionFactory().getCurrentSession();
+		CriteriaBuilder cb = session.getCriteriaBuilder();
+		CriteriaQuery<Long> query = cb.createQuery(Long.class);
+		Root<QueueEntry> root = query.from(QueueEntry.class);
+		List<Predicate> predicates = buildPredicates(cb, root, searchCriteria);
+		query.select(cb.count(root));
+		query.where(cb.and(predicates.toArray(new Predicate[0])));
+		return session.createQuery(query).getSingleResult();
 	}
 	
 	@Override
@@ -243,39 +147,69 @@ public class QueueEntryDaoImpl extends AbstractBaseQueueDaoImpl<QueueEntry> impl
 		return rowsUpdated > 0;
 	}
 	
-	/**
-	 * Convert the given {@link QueueEntrySearchCriteria} into ORM criteria
-	 */
-	private Criteria createCriteriaFromSearchCriteria(QueueEntrySearchCriteria searchCriteria) {
-		Criteria c = getCurrentSession().createCriteria(QueueEntry.class, "qe");
-		c.createAlias("queue", "q");
-		includeVoidedObjects(c, searchCriteria.isIncludedVoided());
-		limitByCollectionProperty(c, "queue", searchCriteria.getQueues());
-		limitByCollectionProperty(c, "q.location", searchCriteria.getLocations());
-		limitByCollectionProperty(c, "q.service", searchCriteria.getServices());
-		limitToEqualsProperty(c, "qe.patient", searchCriteria.getPatient());
-		limitToEqualsProperty(c, "qe.visit", searchCriteria.getVisit());
-		limitByCollectionProperty(c, "qe.priority", searchCriteria.getPriorities());
-		limitByCollectionProperty(c, "qe.status", searchCriteria.getStatuses());
-		limitByCollectionProperty(c, "qe.locationWaitingFor", searchCriteria.getLocationsWaitingFor());
-		limitByCollectionProperty(c, "qe.providerWaitingFor", searchCriteria.getProvidersWaitingFor());
-		limitByCollectionProperty(c, "qe.queueComingFrom", searchCriteria.getQueuesComingFrom());
-		limitToGreaterThanOrEqualToProperty(c, "qe.startedAt", searchCriteria.getStartedOnOrAfter());
-		limitToLessThanOrEqualToProperty(c, "qe.startedAt", searchCriteria.getStartedOnOrBefore());
-		limitToEqualsProperty(c, "qe.startedAt", searchCriteria.getStartedOn());
-		limitToGreaterThanOrEqualToProperty(c, "qe.endedAt", searchCriteria.getEndedOnOrAfter());
-		limitToLessThanOrEqualToProperty(c, "qe.endedAt", searchCriteria.getEndedOnOrBefore());
-		limitToEqualsProperty(c, "qe.endedAt", searchCriteria.getEndedOn());
+	private List<Predicate> buildPredicates(CriteriaBuilder cb, Root<QueueEntry> root,
+	        QueueEntrySearchCriteria searchCriteria) {
+		List<Predicate> predicates = new ArrayList<>();
+		
+		if (!searchCriteria.isIncludedVoided()) {
+			predicates.add(cb.equal(root.get("voided"), false));
+		}
+		limitCollection(predicates, root.get("queue"), searchCriteria.getQueues());
+		if (searchCriteria.getLocations() != null || searchCriteria.getServices() != null) {
+			Join<QueueEntry, Queue> queueJoin = root.join("queue", JoinType.LEFT);
+			limitCollection(predicates, queueJoin.get("location"), searchCriteria.getLocations());
+			limitCollection(predicates, queueJoin.get("service"), searchCriteria.getServices());
+		}
+		if (searchCriteria.getPatient() != null) {
+			predicates.add(cb.equal(root.get("patient"), searchCriteria.getPatient()));
+		}
+		if (searchCriteria.getVisit() != null) {
+			predicates.add(cb.equal(root.get("visit"), searchCriteria.getVisit()));
+		}
+		limitCollection(predicates, root.get("priority"), searchCriteria.getPriorities());
+		limitCollection(predicates, root.get("status"), searchCriteria.getStatuses());
+		limitCollection(predicates, root.get("locationWaitingFor"), searchCriteria.getLocationsWaitingFor());
+		limitCollection(predicates, root.get("providerWaitingFor"), searchCriteria.getProvidersWaitingFor());
+		limitCollection(predicates, root.get("queueComingFrom"), searchCriteria.getQueuesComingFrom());
+		if (searchCriteria.getStartedOnOrAfter() != null) {
+			predicates.add(cb.greaterThanOrEqualTo(root.get("startedAt"), searchCriteria.getStartedOnOrAfter()));
+		}
+		if (searchCriteria.getStartedOnOrBefore() != null) {
+			predicates.add(cb.lessThanOrEqualTo(root.get("startedAt"), searchCriteria.getStartedOnOrBefore()));
+		}
+		if (searchCriteria.getStartedOn() != null) {
+			predicates.add(cb.equal(root.get("startedAt"), searchCriteria.getStartedOn()));
+		}
+		if (searchCriteria.getEndedOnOrAfter() != null) {
+			predicates.add(cb.greaterThanOrEqualTo(root.get("endedAt"), searchCriteria.getEndedOnOrAfter()));
+		}
+		if (searchCriteria.getEndedOnOrBefore() != null) {
+			predicates.add(cb.lessThanOrEqualTo(root.get("endedAt"), searchCriteria.getEndedOnOrBefore()));
+		}
+		if (searchCriteria.getEndedOn() != null) {
+			predicates.add(cb.equal(root.get("endedAt"), searchCriteria.getEndedOn()));
+		}
 		if (searchCriteria.getHasVisit() == Boolean.TRUE) {
-			c.add(Restrictions.isNotNull("qe.visit"));
+			predicates.add(root.get("visit").isNotNull());
 		} else if (searchCriteria.getHasVisit() == Boolean.FALSE) {
-			c.add(Restrictions.isNull("qe.visit"));
+			predicates.add(root.get("visit").isNull());
 		}
 		if (searchCriteria.getIsEnded() == Boolean.TRUE) {
-			c.add(Restrictions.isNotNull("qe.endedAt"));
+			predicates.add(root.get("endedAt").isNotNull());
 		} else if (searchCriteria.getIsEnded() == Boolean.FALSE) {
-			c.add(Restrictions.isNull("qe.endedAt"));
+			predicates.add(root.get("endedAt").isNull());
 		}
-		return c;
+		
+		return predicates;
+	}
+	
+	private <T> void limitCollection(List<Predicate> predicates, Path<T> path, Collection<?> values) {
+		if (values != null) {
+			if (values.isEmpty()) {
+				predicates.add(path.isNull());
+			} else {
+				predicates.add(path.in(values));
+			}
+		}
 	}
 }
